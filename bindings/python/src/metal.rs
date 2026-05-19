@@ -1,15 +1,21 @@
 //! Minimal Metal allocator for host-shared MTLBuffers (Apple silicon UMA).
 //!
 //! Shared-mode buffers are CPU- and GPU-visible: writing through
-//! [`MtlBuffer::contents_ptr`] is observable from the GPU after a normal
+//! [`MTLBuffer::contents_ptr`] is observable from the GPU after a normal
 //! command-buffer commit (no `didModifyRange:` needed on Apple silicon).
+//!
+//! Note: this module's `MTLBuffer` is the Rust-side wrapper. The underlying
+//! Objective-C protocol from `objc2-metal` is aliased as `RawMTLBuffer`
+//! to keep both names visible and disambiguate raw vs. managed flavor.
 
 use std::ffi::c_void;
 use std::sync::OnceLock;
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLBuffer, MTLCreateSystemDefaultDevice, MTLDevice, MTLResourceOptions};
+use objc2_metal::{
+    MTLBuffer as RawMTLBuffer, MTLCreateSystemDefaultDevice, MTLDevice, MTLResourceOptions,
+};
 
 static DEVICE: OnceLock<DeviceHandle> = OnceLock::new();
 
@@ -28,18 +34,18 @@ fn device() -> Result<&'static ProtocolObject<dyn MTLDevice>, &'static str> {
     Ok(&DEVICE.get().unwrap().0)
 }
 
-pub struct MtlBuffer {
-    buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+pub struct MTLBuffer {
+    buf: Retained<ProtocolObject<dyn RawMTLBuffer>>,
     nbytes: usize,
     contents: *mut c_void,
 }
 
 // MTLBuffer is documented thread-safe; disjoint writes through the host
 // alias are sound from multiple threads.
-unsafe impl Send for MtlBuffer {}
-unsafe impl Sync for MtlBuffer {}
+unsafe impl Send for MTLBuffer {}
+unsafe impl Sync for MTLBuffer {}
 
-impl MtlBuffer {
+impl MTLBuffer {
     pub fn alloc_shared(nbytes: usize) -> Result<Self, String> {
         let dev = device().map_err(str::to_owned)?;
         let len = nbytes.max(1);
@@ -62,7 +68,7 @@ impl MtlBuffer {
     /// `from_dlpack` expects this - not the `contents` pointer - in
     /// `DLTensor.data`, since the MPS allocator tracks buffers by ID.
     pub fn as_metal_id_ptr(&self) -> *mut c_void {
-        &*self.buf as *const ProtocolObject<dyn MTLBuffer> as *mut c_void
+        &*self.buf as *const ProtocolObject<dyn RawMTLBuffer> as *mut c_void
     }
 
     #[allow(dead_code)]

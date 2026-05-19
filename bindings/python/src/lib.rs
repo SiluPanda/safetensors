@@ -1,8 +1,8 @@
 #![deny(missing_docs)]
 //! Dummy doc
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod dlpack;
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod metal;
 
 use core::slice;
@@ -11,7 +11,7 @@ use pyo3::exceptions::{PyException, PyFileNotFoundError};
 use pyo3::prelude::*;
 use pyo3::sync::OnceLockExt;
 use pyo3::types::IntoPyDict;
-use pyo3::types::{PyBool, PyByteArray, PyBytes, PyDict, PyEllipsis, PyList, PySlice, PyTuple};
+use pyo3::types::{PyBool, PyByteArray, PyBytes, PyDict, PyList, PySlice};
 use pyo3::Bound as PyBound;
 use pyo3::{intern, PyErr};
 use safetensors::slice::TensorIndexer;
@@ -294,86 +294,41 @@ fn deserialize(py: Python, bytes: &[u8]) -> PyResult<Vec<(String, HashMap<String
     Ok(items)
 }
 
-/// Convert a Python slicing argument into the crate's `TensorIndexer` form.
-///
-/// Accepts: a single slice / int / `Ellipsis`, a tuple of those (with at
-/// most one `Ellipsis` that expands to fill remaining dims), or `[]` (empty
-/// list → degenerate empty selection along the first dim). Non-empty lists
-/// are rejected to match prior behavior.
-fn parse_indexers(slices: &PyBound<'_, PyAny>, shape: &[usize]) -> PyResult<Vec<TensorIndexer>> {
-    let py = slices.py();
+fn slice_to_indexer(
+    (dim_idx, (slice_index, dim)): (usize, (SliceIndex, usize)),
+) -> Result<TensorIndexer, PyErr> {
+    match slice_index {
+        SliceIndex::Slice(slice) => {
+            let py_start = slice.getattr(intern!(slice.py(), "start"))?;
+            let start: Option<usize> = py_start.extract()?;
+            let start = if let Some(start) = start {
+                Bound::Included(start)
+            } else {
+                Bound::Unbounded
+            };
 
-    let items: Vec<PyBound<'_, PyAny>> = if let Ok(tup) = slices.cast::<PyTuple>() {
-        tup.iter().collect()
-    } else if let Ok(lst) = slices.cast::<PyList>() {
-        if lst.is_empty() {
-            // Preserve the previous "empty list = empty selection" behavior.
-            return Ok(vec![TensorIndexer::Narrow(
-                Bound::Included(0),
-                Bound::Excluded(0),
-            )]);
+            let py_stop = slice.getattr(intern!(slice.py(), "stop"))?;
+            let stop: Option<usize> = py_stop.extract()?;
+            let stop = if let Some(stop) = stop {
+                Bound::Excluded(stop)
+            } else {
+                Bound::Unbounded
+            };
+            Ok(TensorIndexer::Narrow(start, stop))
         }
-        return Err(SafetensorError::new_err(
-            "Non empty lists are not implemented",
-        ));
-    } else {
-        vec![slices.clone()]
-    };
-
-    let ellipsis_count = items
-        .iter()
-        .filter(|it| it.is_instance_of::<PyEllipsis>())
-        .count();
-    if ellipsis_count > 1 {
-        return Err(SafetensorError::new_err(
-            "Only one ellipsis (...) is allowed in slice index",
-        ));
-    }
-    let n_explicit = items.len() - ellipsis_count;
-    let n_expansion = shape.len().saturating_sub(n_explicit);
-
-    let mut indexers: Vec<TensorIndexer> = Vec::with_capacity(shape.len());
-    let mut dim_idx = 0usize;
-    for it in items {
-        if it.is_instance_of::<PyEllipsis>() {
-            for _ in 0..n_expansion {
-                indexers.push(TensorIndexer::Narrow(Bound::Unbounded, Bound::Unbounded));
-                dim_idx += 1;
-            }
-        } else if let Ok(slice) = it.cast::<PySlice>() {
-            let start: Option<usize> = slice.getattr(intern!(py, "start"))?.extract()?;
-            let stop: Option<usize> = slice.getattr(intern!(py, "stop"))?.extract()?;
-            let start_b = match start {
-                Some(s) => Bound::Included(s),
-                None => Bound::Unbounded,
-            };
-            let stop_b = match stop {
-                Some(s) => Bound::Excluded(s),
-                None => Bound::Unbounded,
-            };
-            indexers.push(TensorIndexer::Narrow(start_b, stop_b));
-            dim_idx += 1;
-        } else if let Ok(idx) = it.extract::<i32>() {
-            let dim = shape.get(dim_idx).copied().unwrap_or(0);
-            let resolved = if idx < 0 {
-                dim.checked_add_signed(idx as isize).ok_or_else(|| {
+        SliceIndex::Index(idx) => {
+            if idx < 0 {
+                let idx = dim.checked_add_signed(idx as isize).ok_or_else(|| {
                     SafetensorError::new_err(format!(
                         "Invalid index {idx} for dimension {dim_idx} of size {dim}"
                     ))
-                })?
+                })?;
+                Ok(TensorIndexer::Select(idx))
             } else {
-                idx as usize
-            };
-            indexers.push(TensorIndexer::Select(resolved));
-            dim_idx += 1;
-        } else {
-            return Err(SafetensorError::new_err(format!(
-                "Unsupported slice index at position {dim_idx}: expected slice, int, or ellipsis"
-            )));
+                Ok(TensorIndexer::Select(idx as usize))
+            }
         }
     }
-
-    Ok(indexers)
 }
 
 /// Storage backend used to serve tensor bytes.
@@ -631,7 +586,10 @@ impl Version {
 }
 
 struct Open {
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    #[cfg_attr(
+        not(all(target_os = "macos", target_arch = "aarch64")),
+        allow(dead_code)
+    )]
     filename: PathBuf,
     metadata: Metadata,
     offset: usize,
@@ -869,7 +827,7 @@ impl Open {
             }
         }
 
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         if self.device == Device::Mps
             && self.framework == Framework::Pytorch
             && dlpack::torch_mps_compatible(info.dtype)
@@ -1187,14 +1145,14 @@ impl Open {
     /// Single-tensor MPS path: alloc a Shared `MTLBuffer`, fill it from the
     /// active storage source (`mmap` memcpy or `pread`), and hand off via
     /// DLPack
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn get_tensor_mps(&self, name: &str, info: &TensorInfo) -> PyResult<Py<PyAny>> {
         let (begin, end) = info.data_offsets;
         let nbytes = end - begin;
 
         // alloc_shared clamps 0 -> 1 so zero-byte tensors still get a real
         // buffer to hand off; the DLPack shape carries the zero dim.
-        let buf = crate::metal::MtlBuffer::alloc_shared(nbytes)
+        let buf = crate::metal::MTLBuffer::alloc_shared(nbytes)
             .map_err(|e| SafetensorError::new_err(format!("MTLBuffer alloc for {name}: {e}")))?;
         if nbytes > 0 {
             let write_ptr_u = buf.contents_ptr() as usize;
@@ -1266,7 +1224,7 @@ impl Open {
     /// via DLPack. Total memory stays at 1× model (the MTLBuffer is the
     /// destination — no staging copy).
     pub fn get_tensors(&self) -> PyResult<Py<PyDict>> {
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         if self.device == Device::Mps
             && self.framework == Framework::Pytorch
             && self
@@ -1291,7 +1249,7 @@ impl Open {
     /// Bulk-allocates Shared-mode `MTLBuffer`s, parallel-`pread`s straight
     /// into each buffer's host-coherent contents pointer, then DLPack-hands
     /// the buffers off to the framework.
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn get_tensors_mps(&self) -> PyResult<Py<PyDict>> {
         let file = File::open(&self.filename).map_err(|e| {
             PyFileNotFoundError::new_err(format!("Could not open {}: {e}", self.filename.display()))
@@ -1302,7 +1260,7 @@ impl Open {
         disable_page_cache_macos(&file);
 
         let keys = self.metadata.offset_keys();
-        let mut bufs: Vec<crate::metal::MtlBuffer> = Vec::with_capacity(keys.len());
+        let mut bufs: Vec<crate::metal::MTLBuffer> = Vec::with_capacity(keys.len());
         let mut jobs: Vec<PreadJob> = Vec::with_capacity(keys.len());
         let mut metas: Vec<(String, Dtype, Vec<usize>)> = Vec::with_capacity(keys.len());
 
@@ -1316,7 +1274,7 @@ impl Open {
 
             // alloc_shared clamps 0 -> 1 internally; zero-byte tensors still
             // get a valid MTLBuffer and the DLPack shape carries the zero dim.
-            let buf = crate::metal::MtlBuffer::alloc_shared(nbytes).map_err(|e| {
+            let buf = crate::metal::MTLBuffer::alloc_shared(nbytes).map_err(|e| {
                 SafetensorError::new_err(format!("MTLBuffer alloc for {name}: {e}"))
             })?;
             if nbytes > 0 {
@@ -1530,6 +1488,18 @@ struct PySafeSlice {
     storage: Arc<Storage>,
 }
 
+#[derive(FromPyObject)]
+enum SliceIndex<'a> {
+    Slice(PyBound<'a, PySlice>),
+    Index(i32),
+}
+
+#[derive(FromPyObject)]
+enum Slice<'a> {
+    Slice(SliceIndex<'a>),
+    Slices(Vec<SliceIndex<'a>>),
+}
+
 use std::fmt;
 struct Disp(Vec<TensorIndexer>);
 
@@ -1551,9 +1521,33 @@ impl PySafeSlice {
         slices: &PyBound<'_, PyAny>,
         data: &[u8],
     ) -> PyResult<Py<PyAny>> {
-        let indexers = parse_indexers(slices, &self.info.shape)?;
+        let pyslices = slices;
+        let parsed: Slice = pyslices.extract()?;
+        let is_list = pyslices.is_instance_of::<PyList>();
+        let parsed: Vec<SliceIndex> = match parsed {
+            Slice::Slice(slice) => vec![slice],
+            Slice::Slices(slices) => {
+                if slices.is_empty() && is_list {
+                    vec![SliceIndex::Slice(PySlice::new(pyslices.py(), 0, 0, 0))]
+                } else if is_list {
+                    return Err(SafetensorError::new_err(
+                        "Non empty lists are not implemented",
+                    ));
+                } else {
+                    slices
+                }
+            }
+        };
+
+        let shape = self.info.shape.clone();
         let tensor = TensorView::new(self.info.dtype, self.info.shape.clone(), data)
             .map_err(|e| SafetensorError::new_err(format!("Error preparing tensor view: {e}")))?;
+        let indexers: Vec<TensorIndexer> = parsed
+            .into_iter()
+            .zip(shape)
+            .enumerate()
+            .map(slice_to_indexer)
+            .collect::<Result<_, _>>()?;
 
         let iterator = tensor.sliced_data(&indexers).map_err(|e| {
             SafetensorError::new_err(format!(
@@ -1591,9 +1585,31 @@ impl PySafeSlice {
     /// tensor, fill each source segment directly into it via pread/memcpy,
     /// then hand off via DLPack. Skips the bytearray + CPU tensor +
     /// `.to("mps")` round-trip the general path takes.
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn slice_mps(&self, slices: &PyBound<'_, PyAny>) -> PyResult<Py<PyAny>> {
-        let indexers = parse_indexers(slices, &self.info.shape)?;
+        let parsed: Slice = slices.extract()?;
+        let is_list = slices.is_instance_of::<PyList>();
+        let parsed: Vec<SliceIndex> = match parsed {
+            Slice::Slice(s) => vec![s],
+            Slice::Slices(ss) => {
+                if ss.is_empty() && is_list {
+                    vec![SliceIndex::Slice(PySlice::new(slices.py(), 0, 0, 0))]
+                } else if is_list {
+                    return Err(SafetensorError::new_err(
+                        "Non empty lists are not implemented",
+                    ));
+                } else {
+                    ss
+                }
+            }
+        };
+
+        let indexers: Vec<TensorIndexer> = parsed
+            .into_iter()
+            .zip(self.info.shape.clone())
+            .enumerate()
+            .map(slice_to_indexer)
+            .collect::<Result<_, _>>()?;
 
         let (ranges, newshape) =
             safetensors::slice::slice_byte_ranges(self.info.dtype, &self.info.shape, &indexers)
@@ -1608,7 +1624,7 @@ impl PySafeSlice {
         let total: usize = ranges.iter().map(|(a, b)| b - a).sum();
         // alloc_shared clamps 0 -> 1 so empty slices still get a real
         // buffer to hand off; the DLPack shape carries the zero dim.
-        let buf = crate::metal::MtlBuffer::alloc_shared(total)
+        let buf = crate::metal::MTLBuffer::alloc_shared(total)
             .map_err(|e| SafetensorError::new_err(format!("MTLBuffer alloc for slice: {e}")))?;
         if total > 0 {
             let write_ptr_u = buf.contents_ptr() as usize;
@@ -1737,7 +1753,7 @@ impl PySafeSlice {
     }
 
     pub fn __getitem__(&self, slices: &PyBound<'_, PyAny>) -> PyResult<Py<PyAny>> {
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         if self.device == Device::Mps
             && self.framework == Framework::Pytorch
             && !matches!(self.storage.as_ref(), Storage::Paddle(_))
@@ -2006,7 +2022,10 @@ fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()
 /// allocated buffer that outlives this call (the GIL is released for the
 /// duration). The number of workers is capped at 8: beyond that, NVMe and
 /// Apple SSD reads should be I/O-bound rather than CPU-bound.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
 fn parallel_pread(
     py: Python<'_>,
     file: &File,
@@ -2072,22 +2091,22 @@ fn torch_storage_shape(dtype: Dtype, logical_shape: &[usize]) -> PyResult<Vec<us
     Ok(shape)
 }
 
-/// Hand a filled `MtlBuffer` to the framework as a tensor via DLPack.
+/// Hand a filled `MTLBuffer` to the framework as a tensor via DLPack.
 ///
 /// For zero-byte tensors the caller passes a buffer that was clamp-allocated
-/// to 1 byte by `MtlBuffer::alloc_shared`; the DLPack shape still carries a
+/// to 1 byte by `MTLBuffer::alloc_shared`; the DLPack shape still carries a
 /// zero dim so `numel == 0` for the framework consumer.
 ///
 /// For dtypes torch's DLPack doesn't accept natively (F4/F8 variants), the
 /// capsule's wire dtype is `uint8` and we `.view(target)` on the torch side
 /// — same bytes, correct dtype, no copy.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn mps_tensor_from_buf(
     py: Python<'_>,
     framework: &Framework,
     dtype: Dtype,
     logical_shape: &[usize],
-    buf: crate::metal::MtlBuffer,
+    buf: crate::metal::MTLBuffer,
 ) -> PyResult<Py<PyAny>> {
     let storage_shape = torch_storage_shape(dtype, logical_shape)?;
     let shape_i64: Vec<i64> = storage_shape.iter().map(|&n| n as i64).collect();
@@ -2136,7 +2155,7 @@ fn mps_tensor_from_buf(
 ///   MLX copies into its own MTLBuffer on first GPU dispatch.
 /// - **Numpy / Jax / Paddle / Flax**: not relevant for MPS — none have a
 ///   functioning MPS device path.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn ingest_dlpack_mps(
     py: Python<'_>,
     framework: &Framework,

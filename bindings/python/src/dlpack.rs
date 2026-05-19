@@ -6,8 +6,7 @@ use pyo3::prelude::*;
 
 use safetensors::Dtype;
 
-#[cfg(target_os = "macos")]
-use crate::metal::MtlBuffer;
+use crate::metal::MTLBuffer;
 
 #[repr(i32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,8 +70,7 @@ pub(crate) trait AsDevicePtr: Send + 'static {
     fn as_device_ptr(&self) -> *mut c_void;
 }
 
-#[cfg(target_os = "macos")]
-impl AsDevicePtr for MtlBuffer {
+impl AsDevicePtr for MTLBuffer {
     fn as_device_ptr(&self) -> *mut c_void {
         // PyTorch's MPS from_dlpack reads `data` as `id<MTLBuffer>` and
         // looks it up in the MPS allocator's buffer table; passing
@@ -193,7 +191,6 @@ pub(crate) fn cuda_device(ordinal: i32) -> DLDevice {
     }
 }
 
-#[cfg(target_os = "macos")]
 pub(crate) fn metal_device() -> DLDevice {
     DLDevice {
         device_type: DLDeviceType::Metal,
@@ -221,6 +218,10 @@ pub(crate) fn to_capsule<B: AsDevicePtr>(
     let shape_ptr = ctx.shape.as_ptr() as *mut i64;
     let ctx_ptr = Box::into_raw(ctx);
 
+    // Hand the `DLManagedTensor` to the capsule. `managed_tensor_deleter`
+    // (invoked when the capsule is dropped or consumed) reclaims both the
+    // `ManagedCtx` (which owns the device buffer + shape) AND the
+    // `DLManagedTensor` itself via `Box::from_raw`, so no leak on drop.
     let managed = Box::into_raw(Box::new(DLManagedTensor {
         dl_tensor: DLTensor {
             data,
