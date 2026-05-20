@@ -1238,6 +1238,7 @@ impl Open {
         let array: Py<PyAny> = Python::attach(|py| -> PyResult<Py<PyAny>> {
             let pyarray = PyByteArray::new_with(py, total_bytes, |dst| {
                 self.fill_strided_dst(
+                    py,
                     name,
                     info,
                     outer_count,
@@ -1256,9 +1257,15 @@ impl Open {
     /// Fill `dst` with strips packed in row-major order: for each outer-dim
     /// position, copy/pread one strip from each interval in input order.
     /// `dst.len()` must equal the sum of all strip byte counts.
+    ///
+    /// Mmap and Torch sources go through `parallel_memcpy` (releases the
+    /// GIL, splits across cores) which is necessary to match `torch.cat`'s
+    /// parallel copy kernel on Linux. Pread stays serial — its per-call
+    /// cost is already dominated by I/O.
     #[allow(clippy::too_many_arguments)]
     fn fill_strided_dst(
         &self,
+        py: Python<'_>,
         name: &str,
         info: &TensorInfo,
         outer_count: usize,
@@ -1269,21 +1276,49 @@ impl Open {
     ) -> PyResult<()> {
         let (begin, _end) = info.data_offsets;
         let src_base_in_tensor = self.offset + begin;
-        let mut cursor = 0usize;
+
+        // Cumulative per-row destination offsets: strip i within a row starts
+        // at the sum of all preceding strips' sizes.
+        let mut strip_dst_cum: Vec<usize> = Vec::with_capacity(strip_size.len());
+        let mut acc = 0usize;
+        for &n in strip_size {
+            strip_dst_cum.push(acc);
+            acc += n;
+        }
+        let strip_total_per_row = acc;
+        let dst_base = dst.as_mut_ptr() as usize;
+
+        let build_jobs = |src_base: usize| -> Vec<MemcpyJob> {
+            let mut jobs = Vec::with_capacity(outer_count * interval_byte_offset.len());
+            for g in 0..outer_count {
+                let src_row = src_base + g * row_stride;
+                let dst_row = dst_base + g * strip_total_per_row;
+                for (i, (&off, &n)) in interval_byte_offset.iter().zip(strip_size).enumerate() {
+                    jobs.push(MemcpyJob {
+                        src_addr: src_row + off,
+                        dst_addr: dst_row + strip_dst_cum[i],
+                        nbytes: n,
+                    });
+                }
+            }
+            jobs
+        };
 
         match self.storage.as_ref() {
             Storage::Mmap(mmap) => {
-                for g in 0..outer_count {
-                    let row_base = src_base_in_tensor + g * row_stride;
-                    for (off, &n) in interval_byte_offset.iter().zip(strip_size) {
-                        let s = row_base + off;
-                        dst[cursor..cursor + n].copy_from_slice(&mmap[s..s + n]);
-                        cursor += n;
-                    }
-                }
+                // SAFETY of the addresses passed to parallel_memcpy:
+                // - src lives in the mmap held by self.storage (Arc-rooted,
+                //   alive for this call).
+                // - dst was just allocated by the caller and we own a
+                //   `&mut [u8]` over it; the parallel workers carve it into
+                //   disjoint sub-ranges.
+                let src_base = mmap.as_ptr() as usize + src_base_in_tensor;
+                let jobs = build_jobs(src_base);
+                parallel_memcpy(py, &jobs);
             }
             Storage::Pread(file) => {
                 let base = src_base_in_tensor as u64;
+                let mut cursor = 0usize;
                 for g in 0..outer_count {
                     let row_base = base + (g * row_stride) as u64;
                     for (off, &n) in interval_byte_offset.iter().zip(strip_size) {
@@ -1300,39 +1335,16 @@ impl Open {
                 }
             }
             Storage::Torch(storage) => {
-                Python::attach(|py| -> PyResult<()> {
-                    let storage_obj: &Py<PyAny> = storage
-                        .get()
-                        .ok_or_else(|| SafetensorError::new_err("Could not find storage"))?;
-                    let storage_obj = storage_obj.bind(py);
-                    let src_data_ptr: usize = storage_obj
-                        .call_method0(intern!(py, "data_ptr"))?
-                        .extract()?;
-                    let src_base = src_data_ptr + src_base_in_tensor;
-                    py.detach(|| {
-                        for g in 0..outer_count {
-                            let row_base = src_base + g * row_stride;
-                            for (off, &n) in interval_byte_offset.iter().zip(strip_size) {
-                                // SAFETY: row_base + off..+n lives inside the torch
-                                // UntypedStorage held alive by `self.storage`,
-                                // which is Arc-rooted in this Open for the
-                                // duration of this call. dst is a borrow into
-                                // the caller's buffer; both regions are
-                                // disjoint by construction (dst is freshly
-                                // allocated, src is the file-backed storage).
-                                unsafe {
-                                    std::ptr::copy_nonoverlapping(
-                                        (row_base + off) as *const u8,
-                                        dst.as_mut_ptr().add(cursor),
-                                        n,
-                                    );
-                                }
-                                cursor += n;
-                            }
-                        }
-                    });
-                    Ok(())
-                })?;
+                let storage_obj: &Py<PyAny> = storage
+                    .get()
+                    .ok_or_else(|| SafetensorError::new_err("Could not find storage"))?;
+                let storage_obj = storage_obj.bind(py);
+                let src_data_ptr: usize = storage_obj
+                    .call_method0(intern!(py, "data_ptr"))?
+                    .extract()?;
+                let src_base = src_data_ptr + src_base_in_tensor;
+                let jobs = build_jobs(src_base);
+                parallel_memcpy(py, &jobs);
             }
             Storage::Paddle(_) => unreachable!("paddle path filtered earlier"),
         }
@@ -1371,6 +1383,7 @@ impl Open {
                 let dst =
                     unsafe { std::slice::from_raw_parts_mut(write_ptr as *mut u8, total_bytes) };
                 self.fill_strided_dst(
+                    py,
                     name,
                     info,
                     outer_count,
@@ -2137,6 +2150,103 @@ fn parallel_pread(
             Ok(())
         })
     })
+}
+
+/// One in-memory memcpy job: copy `nbytes` from `src_addr` to `dst_addr`.
+#[derive(Clone, Copy)]
+struct MemcpyJob {
+    src_addr: usize,
+    dst_addr: usize,
+    nbytes: usize,
+}
+
+/// Run a set of in-memory memcpy jobs in parallel without holding the GIL.
+///
+/// Caller guarantees `src_addr..+nbytes` is readable and stays alive for the
+/// duration, and `dst_addr..+nbytes` ranges are mutable, disjoint, and stay
+/// alive. Used by the `get_strided_slice` fill paths to parallelize across
+/// the (typically few) strips into the destination buffer.
+///
+/// On Linux, fresh anonymous pages must be faulted in on first write, and
+/// the kernel mmap_lock serializes some of that. Parallelism still helps —
+/// memcpy bandwidth scales with cores up to the DRAM ceiling, and even the
+/// fault path benefits from concurrent zero-page fills.
+fn parallel_memcpy(py: Python<'_>, jobs: &[MemcpyJob]) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    if jobs.is_empty() {
+        return;
+    }
+
+    py.detach(|| {
+        // For one big job, splitting it across threads still helps (parallel
+        // page-faulting and memcpy). Subdivide above this threshold.
+        const PARALLEL_THRESHOLD: usize = 4 * 1024 * 1024;
+        const MAX_CHUNK_BYTES: usize = 8 * 1024 * 1024;
+        const MAX_WORKERS: usize = 8;
+
+        let total_bytes: usize = jobs.iter().map(|j| j.nbytes).sum();
+        if total_bytes < PARALLEL_THRESHOLD {
+            for j in jobs {
+                // SAFETY: caller contract.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        j.src_addr as *const u8,
+                        j.dst_addr as *mut u8,
+                        j.nbytes,
+                    );
+                }
+            }
+            return;
+        }
+
+        // Subdivide so workers stay busy when there are few input jobs.
+        let mut subdivided: Vec<MemcpyJob> = Vec::with_capacity(jobs.len());
+        for j in jobs {
+            let mut off = 0;
+            while off < j.nbytes {
+                let chunk = (j.nbytes - off).min(MAX_CHUNK_BYTES);
+                subdivided.push(MemcpyJob {
+                    src_addr: j.src_addr + off,
+                    dst_addr: j.dst_addr + off,
+                    nbytes: chunk,
+                });
+                off += chunk;
+            }
+        }
+        let jobs = &subdivided;
+
+        let next = AtomicUsize::new(0);
+        let n_workers = std::thread::available_parallelism()
+            .map_or(4, |n| n.get())
+            .min(MAX_WORKERS)
+            .min(jobs.len());
+
+        std::thread::scope(|s| {
+            let mut handles = Vec::with_capacity(n_workers);
+            for _ in 0..n_workers {
+                let next = &next;
+                handles.push(s.spawn(move || loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= jobs.len() {
+                        return;
+                    }
+                    let j = &jobs[i];
+                    // SAFETY: caller contract.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            j.src_addr as *const u8,
+                            j.dst_addr as *mut u8,
+                            j.nbytes,
+                        );
+                    }
+                }));
+            }
+            for h in handles {
+                let _ = h.join();
+            }
+        });
+    });
 }
 
 /// Storage shape for torch tensors. F4 packs two elements per byte, so the
