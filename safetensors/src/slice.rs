@@ -298,18 +298,23 @@ impl<'data> SliceIterator<'data> {
     }
 }
 
+/// Byte ranges into a tensor's data section in iteration order;
+/// concatenating them yields the dense destination layout.
+pub type SliceByteRanges = Vec<(usize, usize)>;
+
+/// Post-slice tensor shape (element counts per dim).
+pub type SlicedShape = Vec<usize>;
+
 /// Compute the byte ranges and post-slice shape for a slicing operation
 /// without requiring the underlying data buffer.
 ///
-/// `indices` lists `(start, stop)` byte ranges into the source tensor in
-/// the order they'd be visited; concatenating them yields the dense
-/// destination layout. Returned in source iteration order (caller may
-/// reverse for pop-based iteration).
+/// The returned [`SliceByteRanges`] is in source iteration order; callers
+/// may reverse it for pop-based iteration.
 pub fn slice_byte_ranges(
     dtype: Dtype,
     shape: &[usize],
     slices: &[TensorIndexer],
-) -> Result<(Vec<(usize, usize)>, Vec<usize>), InvalidSlice> {
+) -> Result<(SliceByteRanges, SlicedShape), InvalidSlice> {
     let n_slice = slices.len();
     let n_shape = shape.len();
     if n_slice > n_shape {
