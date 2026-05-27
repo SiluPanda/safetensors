@@ -1,130 +1,217 @@
+#!/usr/bin/env python3
+"""Wall-time + memory benchmark for `from_pretrained` onto MPS.
+
+Compares loading WITH vs WITHOUT this PR by running the *same* script in two
+environments:
+
+  without PR:  pip-installed `safetensors`
+  with PR:     `maturin develop` build of this repo
+
+It prints the `safetensors` / `transformers` versions so you can tell which
+build is active, then times one
+`AutoModelForCausalLM.from_pretrained(..., device_map="mps")` and reports wall
+time plus several memory signals.
+
+On MPS, `ps -o rss` undercounts badly: MTLBuffer/IOKit memory is accounted
+outside the process resident set, and mmap file-cache pages aren't stably
+resident under pressure. So we sample three things and keep their peaks:
+
+  rss     - `ps -o rss` (kept for reference; misleading on MPS)
+  phys    - `proc_pid_rusage` ri_phys_footprint (Activity Monitor's "Memory")
+  wired   - system-wide `vm_stat` wired pages (MTLBuffers tend to land here)
+  comp    - system-wide compressed pages (memory pressure)
+  swap    - `sysctl vm.swapusage` used
+
+Run it in-situ (don't close your other apps) on a model sized near your RAM so
+swap pressure is realistic.
+
+Usage:
+    python bench_mps_load.py <hf-repo-or-path>
+    python bench_mps_load.py <model> --dtype float16 --device-map mps
+"""
+
 from __future__ import annotations
 
 import argparse
-import contextlib
+import ctypes
+import gc
 import os
 import subprocess
-import sys
+import threading
 import time
-from pathlib import Path
 
 import torch
 
-from safetensors.torch import load_file, save_file
+GB = 1024**3
 
 
-def create_llm(total_gb: float) -> dict[str, torch.Tensor]:
-    H, I, V, BPE = 4096, 12288, 151936, 2  # noqa: E741
-    Q, KV = 32 * 128, 8 * 128
-    fixed = (2 * V * H + H) * BPE
-    per_layer = (H * Q + 2 * H * KV + Q * H + 3 * H * I + 2 * H) * BPE
-    n = max(1, int((total_gb * 1024**3 - fixed) / per_layer))
-    d = torch.bfloat16
-    t: dict[str, torch.Tensor] = {
-        "model.embed_tokens.weight": torch.empty((V, H), dtype=d),
-        "model.norm.weight": torch.empty((H,), dtype=d),
-        "lm_head.weight": torch.empty((V, H), dtype=d),
+# --- per-process memory signals -------------------------------------------
+
+
+def rss_bytes(pid: int) -> int:
+    out = subprocess.check_output(["ps", "-o", "rss=", "-p", str(pid)])
+    return int(out.strip()) * 1024  # macOS `ps` reports RSS in KB
+
+
+class _RUsageInfoV2(ctypes.Structure):
+    # <libproc.h> rusage_info_v2, truncated after the field we read.
+    _fields_ = [
+        ("ri_uuid", ctypes.c_uint8 * 16),
+        ("ri_user_time", ctypes.c_uint64),
+        ("ri_system_time", ctypes.c_uint64),
+        ("ri_pkg_idle_wkups", ctypes.c_uint64),
+        ("ri_interrupt_wkups", ctypes.c_uint64),
+        ("ri_pageins", ctypes.c_uint64),
+        ("ri_wired_size", ctypes.c_uint64),
+        ("ri_resident_size", ctypes.c_uint64),
+        ("ri_phys_footprint", ctypes.c_uint64),
+        ("ri_proc_start_abstime", ctypes.c_uint64),
+        ("ri_proc_exit_abstime", ctypes.c_uint64),
+        ("ri_child_user_time", ctypes.c_uint64),
+        ("ri_child_system_time", ctypes.c_uint64),
+        ("ri_child_pkg_idle_wkups", ctypes.c_uint64),
+        ("ri_child_interrupt_wkups", ctypes.c_uint64),
+        ("ri_child_pageins", ctypes.c_uint64),
+        ("ri_child_elapsed_abstime", ctypes.c_uint64),
+        ("ri_diskio_bytesread", ctypes.c_uint64),
+        ("ri_diskio_byteswritten", ctypes.c_uint64),
+    ]
+
+
+_RUSAGE_INFO_V2 = 2
+_libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+_libproc.proc_pid_rusage.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
+_libproc.proc_pid_rusage.restype = ctypes.c_int
+
+
+def phys_footprint_bytes(pid: int) -> int:
+    """`ri_phys_footprint`: the footprint Activity Monitor shows for the
+    process, including IOKit/GPU (MTLBuffer) and compressed memory."""
+    info = _RUsageInfoV2()
+    rc = _libproc.proc_pid_rusage(pid, _RUSAGE_INFO_V2, ctypes.byref(info))
+    if rc != 0:
+        return 0
+    return int(info.ri_phys_footprint)
+
+
+# --- system-wide memory signals -------------------------------------------
+
+
+def swap_used_bytes() -> int:
+    # vm.swapusage: "total = 3072.00M  used = 1234.50M  free = 1837.50M ..."
+    out = subprocess.check_output(["sysctl", "-n", "vm.swapusage"]).decode()
+    tok = out.split("used =")[1].split()[0]  # e.g. "1234.50M"
+    return int(float(tok[:-1]) * {"K": 1024, "M": 1024**2, "G": 1024**3}[tok[-1]])
+
+
+def vm_stat_bytes() -> dict[str, int]:
+    """Parse `vm_stat`. Returns wired/compressed/free in bytes."""
+    out = subprocess.check_output(["vm_stat"]).decode()
+    page = 4096
+    first = out.splitlines()[0]
+    if "page size of" in first:
+        page = int(first.split("page size of")[1].split("bytes")[0].strip())
+    vals = {}
+    for line in out.splitlines()[1:]:
+        if ":" not in line:
+            continue
+        key, _, rest = line.partition(":")
+        rest = rest.strip().rstrip(".")
+        if rest.isdigit():
+            vals[key.strip()] = int(rest) * page
+    return {
+        "wired": vals.get("Pages wired down", 0),
+        "compressed": vals.get("Pages occupied by compressor", 0),
+        "free": vals.get("Pages free", 0),
     }
-    for i in range(n):
-        p = f"model.layers.{i}"
-        t[f"{p}.self_attn.q_proj.weight"] = torch.empty((Q, H), dtype=d)
-        t[f"{p}.self_attn.k_proj.weight"] = torch.empty((KV, H), dtype=d)
-        t[f"{p}.self_attn.v_proj.weight"] = torch.empty((KV, H), dtype=d)
-        t[f"{p}.self_attn.o_proj.weight"] = torch.empty((H, Q), dtype=d)
-        t[f"{p}.mlp.gate_proj.weight"] = torch.empty((I, H), dtype=d)
-        t[f"{p}.mlp.up_proj.weight"] = torch.empty((I, H), dtype=d)
-        t[f"{p}.mlp.down_proj.weight"] = torch.empty((H, I), dtype=d)
-        t[f"{p}.input_layernorm.weight"] = torch.empty((H,), dtype=d)
-        t[f"{p}.post_attention_layernorm.weight"] = torch.empty((H,), dtype=d)
-    print(f"  {n} layers, {len(t)} tensors")
-    return t
 
 
-@contextlib.contextmanager
-def force_slow():
-    saved = torch.mps.__dict__.pop("_host_alias_storage", None)
-    try:
-        yield
-    finally:
-        if saved is not None:
-            torch.mps._host_alias_storage = saved
+class PeakSampler(threading.Thread):
+    """Polls per-process and system memory every 50ms, keeping the max."""
+
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.pid = os.getpid()
+        self.peak_rss = 0
+        self.peak_phys = 0
+        self.peak_swap = 0
+        self.peak_wired = 0
+        self.peak_comp = 0
+        self._stop = False
+
+    def run(self):
+        while not self._stop:
+            self.peak_rss = max(self.peak_rss, rss_bytes(self.pid))
+            self.peak_phys = max(self.peak_phys, phys_footprint_bytes(self.pid))
+            self.peak_swap = max(self.peak_swap, swap_used_bytes())
+            vm = vm_stat_bytes()
+            self.peak_wired = max(self.peak_wired, vm["wired"])
+            self.peak_comp = max(self.peak_comp, vm["compressed"])
+            time.sleep(0.05)
+
+    def stop(self):
+        self._stop = True
+        self.join()
 
 
-def purge() -> bool:
-    return (
-        subprocess.run(
-            ["sudo", "-n", "purge"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=30,
-        ).returncode
-        == 0
+def main():
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    ap.add_argument("model", help="HF repo id or local model directory")
+    ap.add_argument(
+        "--dtype", default="bfloat16", help="torch dtype (default: bfloat16)"
+    )
+    ap.add_argument(
+        "--device-map", default="mps", help="from_pretrained device_map (default: mps)"
+    )
+    ap.add_argument("--trust-remote-code", action="store_true")
+    args = ap.parse_args()
+
+    import safetensors
+    import transformers
+    from transformers import AutoModelForCausalLM
+
+    if not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
+        raise SystemExit("MPS not available")
+
+    print(
+        f"safetensors {safetensors.__version__}   transformers {transformers.__version__}"
+    )
+    print(f"model: {args.model}   dtype: {args.dtype}   device_map: {args.device_map}")
+    vm0 = vm_stat_bytes()
+    print(
+        f"at start: swap {swap_used_bytes() / GB:.2f}G  "
+        f"wired {vm0['wired'] / GB:.2f}G  compressed {vm0['compressed'] / GB:.2f}G\n"
     )
 
-
-def time_one(path: str, fast: bool) -> float:
+    dtype = getattr(torch, args.dtype)
+    gc.collect()
+    torch.mps.empty_cache()
     torch.mps.synchronize()
+
+    sampler = PeakSampler()
+    sampler.start()
     t0 = time.perf_counter()
-    ctx = contextlib.nullcontext() if fast else force_slow()
-    with ctx:
-        out = load_file(path, device="mps")
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model,
+        dtype=dtype,
+        device_map=args.device_map,
+        trust_remote_code=args.trust_remote_code,
+    )
     torch.mps.synchronize()
     dt = time.perf_counter() - t0
-    for v in list(out.values())[:3]:
-        if v.numel():
-            v.flatten()[:1].item()
-    return dt
+    sampler.stop()
 
-
-def bench(path: str, iters: int, cold: bool) -> None:
-    n = os.path.getsize(path)
-    print(f"\nFile: {path}  ({n / 1024**3:.2f} GB)\nwarmup...")
-    time_one(path, False)
-    time_one(path, True)
-
-    rows = []
-    for label, fast in (("slow (safe_open)", False), ("fast (MPSBulkLoad)", True)):
-        ts = []
-        for i in range(iters):
-            if cold and not purge():
-                print("  ! sudo -n purge failed, results are warm-cache")
-                cold = False
-            dt = time_one(path, fast)
-            ts.append(dt)
-            print(
-                f"  {label:20s} {i + 1}/{iters}: {dt:6.3f}s  ({n / dt / 1024**3:5.2f} GB/s)"
-            )
-        rows.append((label, min(ts), sum(ts) / len(ts)))
-
-    print(f"\n  {'path':22s} {'best':>8s} {'mean':>8s} {'GB/s':>8s}")
-    for lbl, b, m in rows:
-        print(f"  {lbl:22s} {b:6.3f}s {m:6.3f}s {n / b / 1024**3:8.2f}")
-    print(f"\n  speedup: {rows[0][1] / rows[1][1]:.2f}x")
-
-
-def main() -> None:
-    p = argparse.ArgumentParser()
-    p.add_argument("--file", type=Path, required=True)
-    p.add_argument("--gb", type=float, default=16.0)
-    p.add_argument("--iters", type=int, default=3)
-    p.add_argument("--cold", action="store_true")
-    a = p.parse_args()
-
-    if not torch.backends.mps.is_available():
-        sys.exit("MPS not available")
-    if not hasattr(torch.mps, "_host_alias_storage"):
-        sys.exit("needs torch.mps._host_alias_storage (pytorch #180961)")
-
-    path = str(a.file)
-    if not os.path.exists(path):
-        print(f"Generating {path} ({a.gb} GB target) ...")
-        t0 = time.perf_counter()
-        save_file(create_llm(a.gb), path)
-        print(
-            f"  wrote {os.path.getsize(path) / 1024**3:.2f} GB "
-            f"in {time.perf_counter() - t0:.1f}s"
-        )
-    bench(path, a.iters, a.cold)
+    nparams = sum(p.numel() for p in model.parameters())
+    print(
+        f"  from_pretrained {dt:7.2f}s   params {nparams / 1e9:4.1f}B\n"
+        f"  peak  rss {sampler.peak_rss / GB:5.1f}G  phys {sampler.peak_phys / GB:5.1f}G  "
+        f"wired {sampler.peak_wired / GB:5.1f}G  comp {sampler.peak_comp / GB:5.1f}G  "
+        f"swap {sampler.peak_swap / GB:5.1f}G\n"
+        f"  MPS driver {torch.mps.driver_allocated_memory() / GB:5.1f}G  "
+        f"current {torch.mps.current_allocated_memory() / GB:5.1f}G"
+    )
 
 
 if __name__ == "__main__":
