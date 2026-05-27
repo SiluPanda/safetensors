@@ -1142,8 +1142,6 @@ impl Open {
         let (begin, end) = info.data_offsets;
         let nbytes = end - begin;
 
-        // alloc_shared clamps 0 -> 1 so zero-byte tensors still get a real
-        // buffer to hand off; the DLPack shape carries the zero dim.
         let mut buf = crate::metal::MTLBuffer::alloc_shared(nbytes)
             .map_err(|e| SafetensorError::new_err(format!("MTLBuffer alloc for {name}: {e}")))?;
         if nbytes > 0 {
@@ -1236,8 +1234,6 @@ impl Open {
             let nbytes = end - begin;
             metas.push((name.clone(), info.dtype, info.shape.clone()));
 
-            // alloc_shared clamps 0 -> 1 internally; zero-byte tensors still
-            // get a valid MTLBuffer and the DLPack shape carries the zero dim.
             let buf = crate::metal::MTLBuffer::alloc_shared(nbytes).map_err(|e| {
                 SafetensorError::new_err(format!("MTLBuffer alloc for {name}: {e}"))
             })?;
@@ -1586,8 +1582,6 @@ impl PySafeSlice {
                 })?;
 
         let total: usize = ranges.iter().map(|(a, b)| b - a).sum();
-        // alloc_shared clamps 0 -> 1 so empty slices still get a real
-        // buffer to hand off; the DLPack shape carries the zero dim.
         let mut buf = crate::metal::MTLBuffer::alloc_shared(total)
             .map_err(|e| SafetensorError::new_err(format!("MTLBuffer alloc for slice: {e}")))?;
         if total > 0 {
@@ -2035,9 +2029,8 @@ fn torch_storage_shape(dtype: Dtype, logical_shape: &[usize]) -> PyResult<Vec<us
 
 /// Hand a filled `MTLBuffer` to the framework as a tensor via DLPack.
 ///
-/// For zero-byte tensors the caller passes a buffer that was clamp-allocated
-/// to 1 byte by `MTLBuffer::alloc_shared`; the DLPack shape still carries a
-/// zero dim so `numel == 0` for the framework consumer.
+/// Zero-byte tensors arrive as a clamp-allocated buffer (`alloc_shared`); the
+/// DLPack shape still carries the zero dim so `numel == 0` for the consumer.
 ///
 /// For dtypes torch's DLPack doesn't accept natively (F4/F8 variants), the
 /// capsule's wire dtype is `uint8` and we `.view(target)` on the torch side:

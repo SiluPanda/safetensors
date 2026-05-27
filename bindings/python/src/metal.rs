@@ -46,6 +46,10 @@ unsafe impl Send for MTLBuffer {}
 unsafe impl Sync for MTLBuffer {}
 
 impl MTLBuffer {
+    /// Allocates a Shared-mode buffer of `nbytes`. A zero-byte request is
+    /// clamped to a 1-byte allocation so it still yields a valid `MTLBuffer`
+    /// to hand off; the wrapper keeps the original `nbytes` (0), and the
+    /// DLPack shape carries the zero dim, so `numel` stays 0 for the consumer.
     pub fn alloc_shared(nbytes: usize) -> Result<Self, String> {
         let dev = device().map_err(str::to_owned)?;
         let len = nbytes.max(1);
