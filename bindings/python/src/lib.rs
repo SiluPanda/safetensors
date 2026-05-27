@@ -586,11 +586,6 @@ impl Version {
 }
 
 struct Open {
-    #[cfg_attr(
-        not(all(target_os = "macos", target_arch = "aarch64")),
-        allow(dead_code)
-    )]
-    filename: PathBuf,
     metadata: Metadata,
     offset: usize,
     framework: Framework,
@@ -652,7 +647,6 @@ impl Open {
         if backend == Backend::Pread {
             disable_page_cache_macos(&file);
             return Ok(Self {
-                filename,
                 metadata,
                 offset,
                 framework,
@@ -755,7 +749,6 @@ impl Open {
         let storage = Arc::new(storage);
 
         Ok(Self {
-            filename,
             metadata,
             offset,
             framework,
@@ -1192,11 +1185,14 @@ impl Open {
     /// Returns every tensor in the file as a `{name: Tensor}` dict.
     ///
     /// Default behavior is a sequential loop over `get_tensor`. Pytorch on
-    /// Apple-silicon MPS instead bulk-allocates Shared `MTLBuffer`s,
-    /// parallel-`pread`s into them, and hands them to torch via DLPack.
-    /// Total memory stays at 1x model (the MTLBuffer is the destination;
-    /// no staging copy).
+    /// Apple-silicon MPS with the `pread` backend instead bulk-allocates
+    /// Shared `MTLBuffer`s, parallel-`pread`s into them, and hands them to
+    /// torch via DLPack (1x model memory, the MTLBuffer is the destination).
+    /// The `mmap` backend uses the sequential loop, reading through the mmap.
     pub fn get_tensors(&self) -> PyResult<Py<PyDict>> {
+        // The bulk parallel-pread path is gated on the `pread` backend so the
+        // `backend` choice is honored: `mmap` falls through to the per-tensor
+        // loop below, which reads through the mmap via `get_tensor_mps`.
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         if self.device == Device::Mps
             && self.framework == Framework::Pytorch
@@ -1206,7 +1202,9 @@ impl Open {
                 .values()
                 .all(|info| dlpack::torch_mps_compatible(info.dtype))
         {
-            return self.get_tensors_mps();
+            if let Storage::Pread(file) = self.storage.as_ref() {
+                return self.get_tensors_mps(file);
+            }
         }
 
         Python::attach(|py| -> PyResult<Py<PyDict>> {
@@ -1221,17 +1219,10 @@ impl Open {
 
     /// Bulk-allocates Shared-mode `MTLBuffer`s, parallel-`pread`s straight
     /// into each buffer's host-coherent contents pointer, then DLPack-hands
-    /// the buffers off to the framework.
+    /// the buffers off to the framework. `file` is the `pread` backend's fd
+    /// (already `F_NOCACHE`d); the caller selects this path only for `Pread`.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    fn get_tensors_mps(&self) -> PyResult<Py<PyDict>> {
-        let file = File::open(&self.filename).map_err(|e| {
-            PyFileNotFoundError::new_err(format!("Could not open {}: {e}", self.filename.display()))
-        })?;
-        // Fresh fd used for direct pread into MTLBuffers; skip the page
-        // cache so the load doesn't leave a model-sized footprint in
-        // file-backed pages after we're done.
-        disable_page_cache_macos(&file);
-
+    fn get_tensors_mps(&self, file: &File) -> PyResult<Py<PyDict>> {
         let keys = self.metadata.offset_keys();
         let mut bufs: Vec<crate::metal::MTLBuffer> = Vec::with_capacity(keys.len());
         let mut jobs: Vec<PreadJob> = Vec::with_capacity(keys.len());
@@ -1262,7 +1253,7 @@ impl Open {
         }
 
         Python::attach(|py| -> PyResult<Py<PyDict>> {
-            if let Err((name, e)) = parallel_pread(py, &file, &jobs) {
+            if let Err((name, e)) = parallel_pread(py, file, &jobs) {
                 return Err(SafetensorError::new_err(format!(
                     "pread failed for tensor {name}: {e}"
                 )));
