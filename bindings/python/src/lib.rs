@@ -1143,8 +1143,7 @@ impl Open {
     }
 
     /// Single-tensor MPS path: alloc a Shared `MTLBuffer`, fill it from the
-    /// active storage source (`mmap` memcpy or `pread`), and hand off via
-    /// DLPack
+    /// active storage source, and hand off via DLPack.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn get_tensor_mps(&self, name: &str, info: &TensorInfo) -> PyResult<Py<PyAny>> {
         let (begin, end) = info.data_offsets;
@@ -1152,58 +1151,33 @@ impl Open {
 
         // alloc_shared clamps 0 -> 1 so zero-byte tensors still get a real
         // buffer to hand off; the DLPack shape carries the zero dim.
-        let buf = crate::metal::MTLBuffer::alloc_shared(nbytes)
+        let mut buf = crate::metal::MTLBuffer::alloc_shared(nbytes)
             .map_err(|e| SafetensorError::new_err(format!("MTLBuffer alloc for {name}: {e}")))?;
         if nbytes > 0 {
-            let write_ptr_u = buf.contents_ptr() as usize;
+            let dst = buf.as_mut_slice();
             match self.storage.as_ref() {
                 Storage::Mmap(mmap) => {
-                    let src = &mmap[self.offset + begin..self.offset + end];
-                    // SAFETY: write_ptr addresses a freshly-allocated MTLBuffer
-                    // of exactly `nbytes` we own; src is the live mmap region.
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(src.as_ptr(), write_ptr_u as *mut u8, nbytes);
-                    }
+                    dst.copy_from_slice(&mmap[self.offset + begin..self.offset + end]);
                 }
                 Storage::Pread(file) => {
-                    let file_offset = (self.offset + begin) as u64;
-                    let read_result: std::io::Result<()> = Python::attach(|py| {
-                        py.detach(|| {
-                            // SAFETY: write_ptr/nbytes name a freshly-allocated
-                            // MTLBuffer; no other thread sees it yet.
-                            let dst = unsafe {
-                                std::slice::from_raw_parts_mut(write_ptr_u as *mut u8, nbytes)
-                            };
-                            read_exact_at(file, dst, file_offset)
-                        })
-                    });
-                    read_result
+                    read_exact_at(file, dst, (self.offset + begin) as u64)
                         .map_err(|e| SafetensorError::new_err(format!("pread for {name}: {e}")))?;
                 }
-                Storage::Torch(storage) => {
-                    Python::attach(|py| -> PyResult<()> {
-                        let storage_obj = storage
-                            .get()
-                            .ok_or_else(|| SafetensorError::new_err("Could not find storage"))?
-                            .bind(py);
-                        let src_data_ptr: usize = storage_obj
-                            .call_method0(intern!(py, "data_ptr"))?
-                            .extract()?;
-                        let src_addr = src_data_ptr + self.offset + begin;
-                        py.detach(|| {
-                            // SAFETY: src spans the torch UntypedStorage held alive
-                            // by `self.storage`; dst is our owned MTLBuffer.
-                            unsafe {
-                                std::ptr::copy_nonoverlapping(
-                                    src_addr as *const u8,
-                                    write_ptr_u as *mut u8,
-                                    nbytes,
-                                );
-                            }
-                        });
-                        Ok(())
-                    })?;
-                }
+                Storage::Torch(storage) => Python::attach(|py| -> PyResult<()> {
+                    let storage_obj = storage
+                        .get()
+                        .ok_or_else(|| SafetensorError::new_err("Could not find storage"))?
+                        .bind(py);
+                    let src_data_ptr: usize = storage_obj
+                        .call_method0(intern!(py, "data_ptr"))?
+                        .extract()?;
+                    let src_addr = src_data_ptr + self.offset + begin;
+                    // SAFETY: src_addr..+nbytes spans the torch UntypedStorage
+                    // held alive by `self.storage` for this call.
+                    let src = unsafe { std::slice::from_raw_parts(src_addr as *const u8, nbytes) };
+                    dst.copy_from_slice(src);
+                    Ok(())
+                })?,
                 Storage::Paddle(_) => {
                     return Err(SafetensorError::new_err(
                         "Paddle + MPS is not a supported combination",
@@ -1217,12 +1191,11 @@ impl Open {
 
     /// Returns every tensor in the file as a `{name: Tensor}` dict.
     ///
-    /// Default behavior is a sequential loop over `get_tensor`. On macOS with
-    /// `device="mps"` and a non-Tensorflow framework, bulk-allocates Metal
-    /// shared-storage `MTLBuffer`s ourselves, parallel-`pread`s into their
-    /// host-coherent contents pointer, and hands ownership to the framework
-    /// via DLPack. Total memory stays at 1× model (the MTLBuffer is the
-    /// destination — no staging copy).
+    /// Default behavior is a sequential loop over `get_tensor`. Pytorch on
+    /// Apple-silicon MPS instead bulk-allocates Shared `MTLBuffer`s,
+    /// parallel-`pread`s into them, and hands them to torch via DLPack.
+    /// Total memory stays at 1x model (the MTLBuffer is the destination;
+    /// no staging copy).
     pub fn get_tensors(&self) -> PyResult<Py<PyDict>> {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         if self.device == Device::Mps
@@ -1254,7 +1227,7 @@ impl Open {
         let file = File::open(&self.filename).map_err(|e| {
             PyFileNotFoundError::new_err(format!("Could not open {}: {e}", self.filename.display()))
         })?;
-        // Fresh fd used for direct pread into MTLBuffers — skip the page
+        // Fresh fd used for direct pread into MTLBuffers; skip the page
         // cache so the load doesn't leave a model-sized footprint in
         // file-backed pages after we're done.
         disable_page_cache_macos(&file);
@@ -1624,82 +1597,60 @@ impl PySafeSlice {
         let total: usize = ranges.iter().map(|(a, b)| b - a).sum();
         // alloc_shared clamps 0 -> 1 so empty slices still get a real
         // buffer to hand off; the DLPack shape carries the zero dim.
-        let buf = crate::metal::MTLBuffer::alloc_shared(total)
+        let mut buf = crate::metal::MTLBuffer::alloc_shared(total)
             .map_err(|e| SafetensorError::new_err(format!("MTLBuffer alloc for slice: {e}")))?;
         if total > 0 {
-            let write_ptr_u = buf.contents_ptr() as usize;
             let tensor_base = self.offset + self.info.data_offsets.0;
+            let dst = buf.as_mut_slice();
 
             match self.storage.as_ref() {
                 Storage::Mmap(mmap) => {
                     let mut dst_off = 0usize;
                     for &(src_lo, src_hi) in &ranges {
                         let len = src_hi - src_lo;
-                        let src = &mmap[tensor_base + src_lo..tensor_base + src_hi];
-                        // SAFETY: write_ptr_u/len address a freshly-allocated
-                        // MTLBuffer of exactly `total` bytes; src is the live mmap.
-                        unsafe {
-                            std::ptr::copy_nonoverlapping(
-                                src.as_ptr(),
-                                (write_ptr_u + dst_off) as *mut u8,
-                                len,
-                            );
-                        }
+                        dst[dst_off..dst_off + len]
+                            .copy_from_slice(&mmap[tensor_base + src_lo..tensor_base + src_hi]);
                         dst_off += len;
                     }
                 }
                 Storage::Pread(file) => {
-                    let ranges_ref = &ranges;
-                    let read_result: std::io::Result<()> = Python::attach(|py| {
-                        py.detach(|| {
-                            let mut dst_off = 0usize;
-                            for &(src_lo, src_hi) in ranges_ref {
-                                let len = src_hi - src_lo;
-                                // SAFETY: freshly-allocated MTLBuffer, disjoint segments.
-                                let dst = unsafe {
-                                    std::slice::from_raw_parts_mut(
-                                        (write_ptr_u + dst_off) as *mut u8,
-                                        len,
-                                    )
-                                };
-                                read_exact_at(file, dst, (tensor_base + src_lo) as u64)?;
-                                dst_off += len;
-                            }
-                            Ok(())
-                        })
-                    });
-                    read_result
+                    let mut dst_off = 0usize;
+                    for &(src_lo, src_hi) in &ranges {
+                        let len = src_hi - src_lo;
+                        read_exact_at(
+                            file,
+                            &mut dst[dst_off..dst_off + len],
+                            (tensor_base + src_lo) as u64,
+                        )
                         .map_err(|e| SafetensorError::new_err(format!("pread for slice: {e}")))?;
+                        dst_off += len;
+                    }
                 }
-                Storage::Torch(storage) => {
-                    Python::attach(|py| -> PyResult<()> {
-                        let storage_obj = storage
-                            .get()
-                            .ok_or_else(|| SafetensorError::new_err("Could not find storage"))?
-                            .bind(py);
-                        let src_data_ptr: usize = storage_obj
-                            .call_method0(intern!(py, "data_ptr"))?
-                            .extract()?;
-                        let ranges_ref = &ranges;
-                        py.detach(|| {
-                            let mut dst_off = 0usize;
-                            for &(src_lo, src_hi) in ranges_ref {
-                                let len = src_hi - src_lo;
-                                // SAFETY: torch storage outlives this call via
-                                // self.storage; dst is our owned MTLBuffer.
-                                unsafe {
-                                    std::ptr::copy_nonoverlapping(
-                                        (src_data_ptr + tensor_base + src_lo) as *const u8,
-                                        (write_ptr_u + dst_off) as *mut u8,
-                                        len,
-                                    );
-                                }
-                                dst_off += len;
-                            }
-                        });
-                        Ok(())
-                    })?;
-                }
+                Storage::Torch(storage) => Python::attach(|py| -> PyResult<()> {
+                    let storage_obj = storage
+                        .get()
+                        .ok_or_else(|| SafetensorError::new_err("Could not find storage"))?
+                        .bind(py);
+                    let src_data_ptr: usize = storage_obj
+                        .call_method0(intern!(py, "data_ptr"))?
+                        .extract()?;
+                    let (_, src_end) = self.info.data_offsets;
+                    // SAFETY: the storage spans the tensor's bytes; held alive
+                    // by `self.storage` for this call.
+                    let src = unsafe {
+                        std::slice::from_raw_parts(
+                            (src_data_ptr + tensor_base) as *const u8,
+                            src_end - self.info.data_offsets.0,
+                        )
+                    };
+                    let mut dst_off = 0usize;
+                    for &(src_lo, src_hi) in &ranges {
+                        let len = src_hi - src_lo;
+                        dst[dst_off..dst_off + len].copy_from_slice(&src[src_lo..src_hi]);
+                        dst_off += len;
+                    }
+                    Ok(())
+                })?,
                 Storage::Paddle(_) => unreachable!("Paddle excluded at __getitem__ entry"),
             }
         }
@@ -1965,7 +1916,7 @@ struct PreadJob {
 
 /// Mark `file` to bypass the page cache for `read`/`pread` calls on macOS.
 ///
-/// `F_NOCACHE` only affects I/O syscalls on this fd — it has no effect on
+/// `F_NOCACHE` only affects I/O syscalls on this fd; it has no effect on
 /// pages accessed via `mmap`, so this is only useful for fds we'll
 /// `pread()` from. Best-effort: failures (e.g. on filesystems that don't
 /// honor it) are ignored. No-op on non-macOS.
@@ -2098,8 +2049,8 @@ fn torch_storage_shape(dtype: Dtype, logical_shape: &[usize]) -> PyResult<Vec<us
 /// zero dim so `numel == 0` for the framework consumer.
 ///
 /// For dtypes torch's DLPack doesn't accept natively (F4/F8 variants), the
-/// capsule's wire dtype is `uint8` and we `.view(target)` on the torch side
-/// — same bytes, correct dtype, no copy.
+/// capsule's wire dtype is `uint8` and we `.view(target)` on the torch side:
+/// same bytes, correct dtype, no copy.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn mps_tensor_from_buf(
     py: Python<'_>,
@@ -2153,7 +2104,7 @@ fn mps_tensor_from_buf(
 ///   shipped yet (needs allocator::Buffer wrapping + Deleter plumbing).
 ///   The numpy-buffer-protocol path is *not* end-to-end zero-copy:
 ///   MLX copies into its own MTLBuffer on first GPU dispatch.
-/// - **Numpy / Jax / Paddle / Flax**: not relevant for MPS — none have a
+/// - **Numpy / Jax / Paddle / Flax**: not relevant for MPS; none have a
 ///   functioning MPS device path.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn ingest_dlpack_mps(

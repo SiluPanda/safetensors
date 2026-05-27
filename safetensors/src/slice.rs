@@ -338,13 +338,9 @@ pub fn slice_byte_ranges(
                 TensorIndexer::Narrow(Bound::Unbounded, Bound::Included(stop)) => (0, *stop + 1),
                 TensorIndexer::Narrow(Bound::Included(s), Bound::Unbounded) => (*s, dim),
                 TensorIndexer::Narrow(Bound::Included(s), Bound::Excluded(stop)) => (*s, *stop),
-                TensorIndexer::Narrow(Bound::Included(s), Bound::Included(stop)) => {
-                    (*s, *stop + 1)
-                }
+                TensorIndexer::Narrow(Bound::Included(s), Bound::Included(stop)) => (*s, *stop + 1),
                 TensorIndexer::Narrow(Bound::Excluded(s), Bound::Unbounded) => (*s + 1, dim),
-                TensorIndexer::Narrow(Bound::Excluded(s), Bound::Excluded(stop)) => {
-                    (*s + 1, *stop)
-                }
+                TensorIndexer::Narrow(Bound::Excluded(s), Bound::Excluded(stop)) => (*s + 1, *stop),
                 TensorIndexer::Narrow(Bound::Excluded(s), Bound::Included(stop)) => {
                     (*s + 1, *stop + 1)
                 }

@@ -8,6 +8,12 @@ use safetensors::Dtype;
 
 use crate::metal::MTLBuffer;
 
+// The structs and enums below are the ABI consumers read across the FFI
+// boundary, so they must match the DLPack C definitions byte-for-byte
+// (layout, field order, enum discriminants). Do not reorder or change
+// representations without checking against the canonical header:
+// https://github.com/dmlc/dlpack/blob/main/include/dlpack/dlpack.h
+
 #[repr(i32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DLDeviceType {
@@ -121,12 +127,10 @@ pub(crate) fn dtype_to_dlpack(dtype: Dtype) -> DLDataType {
     }
 }
 
-/// Whether torch's `from_dlpack` accepts this dtype natively. DLPack v1.0
-/// reserved codes for F4/F6/F8 variants (8..=18) but PyTorch hasn't wired
-/// them up; passing them as `OpaqueHandle` raises `BufferError: Unsupported
-/// code 3`. For such dtypes the MPS path produces a `uint8` capsule of the
-/// torch storage shape and the consumer does `.view(target_dtype)` to
-/// reinterpret — same bytes, correct dtype, no copy.
+/// Whether torch's `from_dlpack` accepts this dtype natively. F4/F6/F8
+/// variants have DLPack v1.0 codes (8..=18) that PyTorch doesn't accept yet
+/// (raises `BufferError: Unsupported code 3`); for those the MPS path emits
+/// a `uint8` capsule and the consumer `.view()`s to reinterpret.
 pub(crate) fn dlpack_supported_native(dtype: Dtype) -> bool {
     matches!(
         dtype,
@@ -169,7 +173,7 @@ pub(crate) fn uint8_dlpack() -> DLDataType {
     }
 }
 
-/// Whether torch's MPS fast path can ingest this dtype — either via native
+/// Whether torch's MPS fast path can ingest this dtype, either via native
 /// DLPack support or via the `uint8 + view`-cast workaround.
 pub(crate) fn torch_mps_compatible(dtype: Dtype) -> bool {
     dlpack_supported_native(dtype) || torch_view_target(dtype).is_some()

@@ -64,6 +64,15 @@ impl MTLBuffer {
         self.contents
     }
 
+    /// Host-visible bytes as a mutable slice, for filling the buffer before
+    /// it is handed to a framework. `&mut self` rules out aliasing access.
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: `contents` is the host-coherent pointer of a Shared-mode
+        // MTLBuffer allocated for at least `nbytes` (clamped to 1 internally),
+        // valid for the buffer's lifetime.
+        unsafe { std::slice::from_raw_parts_mut(self.contents as *mut u8, self.nbytes) }
+    }
+
     /// The Objective-C buffer pointer (`id<MTLBuffer>`). PyTorch's MPS
     /// `from_dlpack` expects this - not the `contents` pointer - in
     /// `DLTensor.data`, since the MPS allocator tracks buffers by ID.
