@@ -336,9 +336,7 @@ class TorchTestCase(unittest.TestCase):
         save_file(data, local)
 
         for backend in ("mmap", "pread"):
-            with safe_open(
-                local, framework="pt", device="mps", backend=backend
-            ) as f:
+            with safe_open(local, framework="pt", device="mps", backend=backend) as f:
                 # contiguous leading-dim slab
                 contiguous = f.get_slice("emb")[8:20, :]
                 self.assertEqual(contiguous.device.type, "mps")
