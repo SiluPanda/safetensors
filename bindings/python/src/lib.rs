@@ -664,6 +664,7 @@ impl Open {
         framework: Framework,
         device: Option<Device>,
         backend: Backend,
+        prefetch: bool,
     ) -> PyResult<Self> {
         let file = File::open(&filename).map_err(|_| {
             PyFileNotFoundError::new_err(format!(
@@ -1395,14 +1396,15 @@ impl safe_open {
 #[pymethods]
 impl safe_open {
     #[new]
-    #[pyo3(signature = (filename, framework, device=Some(Device::Cpu), *, backend=Backend::Mmap))]
+    #[pyo3(signature = (filename, framework, device=Some(Device::Cpu), *, backend=Backend::Mmap, prefetch=false))]
     fn new(
         filename: PathBuf,
         framework: Framework,
         device: Option<Device>,
         backend: Backend,
+        prefetch: bool,
     ) -> PyResult<Self> {
-        let inner = Some(Open::new(filename, framework, device, backend)?);
+        let inner = Some(Open::new(filename, framework, device, backend, prefetch)?);
         Ok(Self { inner })
     }
 
@@ -2405,12 +2407,13 @@ impl _safe_open_handle {
 #[pymethods]
 impl _safe_open_handle {
     #[new]
-    #[pyo3(signature = (f, framework, device=Some(Device::Cpu), *, backend=Backend::Mmap))]
+    #[pyo3(signature = (f, framework, device=Some(Device::Cpu), *, backend=Backend::Mmap, prefetch=false))]
     fn new(
         f: Py<PyAny>,
         framework: Framework,
         device: Option<Device>,
         backend: Backend,
+        prefetch: bool,
     ) -> PyResult<Self> {
         let filename = Python::attach(|py| -> PyResult<PathBuf> {
             let _ = f.getattr(py, "fileno")?;
@@ -2418,7 +2421,7 @@ impl _safe_open_handle {
             let filename: PathBuf = filename.extract(py)?;
             Ok(filename)
         })?;
-        let inner = Some(Open::new(filename, framework, device, backend)?);
+        let inner = Some(Open::new(filename, framework, device, backend, prefetch)?);
         Ok(Self { inner })
     }
 
