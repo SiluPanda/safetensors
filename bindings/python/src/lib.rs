@@ -5,6 +5,9 @@ mod dlpack;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod metal;
 
+mod cuda;
+mod engine;
+
 use core::slice;
 use memmap2::{Mmap, MmapOptions};
 use pyo3::exceptions::{PyException, PyFileNotFoundError};
