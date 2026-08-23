@@ -17,7 +17,7 @@ serde_json = "1.0"
 [dependencies.safetensors]
 path = "../../safetensors"
 
-[target.'cfg(target_os = "macos")'.dependencies]
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 # Metal-direct MTLBuffer path is Apple-silicon-only: Shared-mode buffers rely
