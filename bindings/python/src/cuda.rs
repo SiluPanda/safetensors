@@ -3,8 +3,6 @@ use std::{
     sync::OnceLock,
 };
 
-use libc::dlopen;
-
 pub type Stream = *mut c_void;
 pub type Event = *mut c_void;
 pub type MemPool = *mut c_void;
@@ -41,6 +39,7 @@ cuda_fns! {
     cudaFreeAsync:               fn(*mut c_void, Stream) -> Err,
     cudaMemcpyAsync:             fn(*mut c_void, *const c_void, usize, c_int, Stream) -> Err,
     cudaStreamCreateWithFlags:   fn(*mut Stream, c_uint) -> Err,
+    cudaStreamDestroy:           fn(Stream) -> Err,
     cudaStreamWaitEvent:         fn(Stream, Event, c_uint) -> Err,
     cudaEventCreateWithFlags:    fn(*mut Event, c_uint) -> Err,
     cudaEventRecord:             fn(Event, Stream) -> Err,
@@ -138,6 +137,10 @@ impl CudaApi {
             (self.f.cudaStreamCreateWithFlags)(&mut s, CUDA_STREAM_NON_BLOCKING)
         })?;
         Ok(s)
+    }
+
+    pub fn stream_destroy(&self, s: Stream) -> Result<(), CudaError> {
+        self.check(unsafe { (self.f.cudaStreamDestroy)(s) })
     }
 
     pub fn event_create(&self) -> Result<Event, CudaError> {
