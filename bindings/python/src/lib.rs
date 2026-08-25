@@ -1,6 +1,5 @@
 #![deny(missing_docs)]
 //! Dummy doc
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod dlpack;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod metal;
@@ -659,6 +658,7 @@ struct Open {
     framework: Framework,
     device: Device,
     storage: Arc<Storage>,
+    prefetch_loader: Option<Loader>,
 }
 
 impl Open {
@@ -713,14 +713,39 @@ impl Open {
             Ok(())
         })?;
 
+        if prefetch && backend != Backend::Pread {
+            return Err(SafetensorError::new_err(
+                "prefetch is only compatible with the Pread backend",
+            ));
+        }
+
         if backend == Backend::Pread {
             disable_page_cache_macos(&file);
+
+            let file = Arc::new(file);
+            let prefetch_loader = if prefetch {
+                let Device::Cuda(device_idx) = device else {
+                    return Err(SafetensorError::new_err(
+                        "prefetch is only compatible with cuda devices",
+                    ));
+                };
+                Some(Loader::load(
+                    file.clone(),
+                    &metadata,
+                    offset,
+                    device_idx as i32,
+                    8,
+                )?)
+            } else {
+                None
+            };
             return Ok(Self {
                 metadata,
                 offset,
                 framework,
                 device,
-                storage: Arc::new(Storage::Pread(Arc::new(file))),
+                storage: Arc::new(Storage::Pread(file)),
+                prefetch_loader,
             });
         }
 
@@ -823,6 +848,7 @@ impl Open {
             framework,
             device,
             storage,
+            prefetch_loader: None,
         })
     }
 
@@ -876,6 +902,30 @@ impl Open {
         let info = self.metadata.info(name).ok_or_else(|| {
             SafetensorError::new_err(format!("File does not contain tensor {name}",))
         })?;
+
+        if matches!(self.device, Device::Cuda(_)) && self.framework == Framework::Pytorch
+        // TODO: cuda equivalent?
+        // && dlpack::torch_mps_compatible(info.dtype)
+        // && torch_supports_mps_dlpack()
+        {
+            if let Some(loader) = self.prefetch_loader.as_ref() {
+                let idx = self.metadata.tensor_idx(name).ok_or_else(|| {
+                    SafetensorError::new_err(format!("File does not contain tensor {name}",))
+                })?;
+                return Python::attach(|py| {
+                    let buffer = py.detach(|| loader.take_tensor(idx))?;
+                    match buffer {
+                        DeviceBuffer::Cuda(buffer) => cuda_tensor_from_buffer(
+                            py,
+                            &self.framework,
+                            info.dtype,
+                            &info.shape,
+                            buffer,
+                        ),
+                    }
+                });
+            }
+        }
 
         // Pytorch + CUDA: write into a pinned CPU tensor and `.to(cuda)` for
         // async DMA, regardless of backend. The byte source differs per
@@ -1366,6 +1416,67 @@ impl Open {
             )))
         }
     }
+
+    pub fn tensor_stream(&self) -> PyResult<TensorStream> {
+        let Some(loader) = self.prefetch_loader.as_ref() else {
+            return Err(SafetensorError::new_err(
+                "`tensor_stream` requires `safe_open(..., prefetch=True)`",
+            ));
+        };
+        let mut names = vec![String::new(); self.metadata.tensor_infos().len()];
+        for name in self.metadata.offset_keys() {
+            let idx = self.metadata.tensor_idx(&name).ok_or_else(|| {
+                SafetensorError::new_err(format!("File does not contain tensor {name}"))
+            })?;
+            names[idx] = name;
+        }
+        let infos = self.metadata.tensor_infos().to_vec();
+
+        Ok(TensorStream {
+            iter: loader.iter(),
+            names,
+            infos,
+            framework: self.framework.clone(),
+            _keepalive: None,
+        })
+    }
+}
+
+/// Yields tensors in load-order
+#[pyclass]
+pub struct TensorStream {
+    iter: TensorIter,
+    names: Vec<String>,
+    infos: Vec<TensorInfo>,
+    framework: Framework,
+    _keepalive: Option<Py<PyAny>>,
+}
+
+#[pymethods]
+impl TensorStream {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<(String, Py<PyAny>)>> {
+        match py.detach(|| self.iter.next()) {
+            None => Ok(None),
+            Some(Err(e)) => Err(e.into()),
+            Some(Ok((idx, buffer))) => {
+                let info = &self.infos[idx];
+                let tensor = match buffer {
+                    DeviceBuffer::Cuda(buffer) => cuda_tensor_from_buffer(
+                        py,
+                        &self.framework,
+                        info.dtype,
+                        &info.shape,
+                        buffer,
+                    )?,
+                };
+                Ok(Some((self.names[idx].clone(), tensor)))
+            }
+        }
+    }
 }
 
 /// Opens a safetensors lazily and returns tensors as asked
@@ -1500,6 +1611,12 @@ impl safe_open {
         self.inner()?.get_slice(name)
     }
 
+    pub fn tensor_stream(slf: PyRef<'_, Self>) -> PyResult<TensorStream> {
+        let mut stream = slf.inner()?.tensor_stream()?;
+        stream._keepalive = Some(Py::from(slf).into_any());
+        Ok(stream)
+    }
+
     /// Start the context manager
     pub fn __enter__(slf: Py<Self>) -> Py<Self> {
         slf
@@ -1521,6 +1638,8 @@ struct PySafeSlice {
 }
 
 use std::fmt;
+
+use crate::engine::{CudaBuffer, DeviceBuffer, Loader, TensorIter};
 struct Disp(Vec<TensorIndexer>);
 
 /// Should be more readable that the standard
@@ -2043,6 +2162,70 @@ fn torch_storage_shape(dtype: Dtype, logical_shape: &[usize]) -> PyResult<Vec<us
     Ok(shape)
 }
 
+fn torch_empty_cuda(
+    py: Python<'_>,
+    torch: &PyBound<PyModule>,
+    dtype: Dtype,
+    storage_shape: &[usize],
+    device: i32,
+) -> PyResult<Py<PyAny>> {
+    let dtype: Py<PyAny> = get_pydtype(torch, dtype, false)?;
+    let shape: Py<PyAny> = storage_shape.to_vec().into_pyobject(py)?.into();
+    let device: Py<PyAny> = format!("cuda:{device}").into_pyobject(py)?.into();
+    let kwargs = [
+        (intern!(py, "dtype"), dtype),
+        (intern!(py, "device"), device),
+    ]
+    .into_py_dict(py)?;
+    Ok(torch
+        .call_method(intern!(py, "empty"), (shape,), Some(&kwargs))?
+        .unbind())
+}
+
+fn cuda_tensor_from_buffer(
+    py: Python<'_>,
+    framework: &Framework,
+    dtype: Dtype,
+    logical_shape: &[usize],
+    buffer: CudaBuffer,
+) -> PyResult<Py<PyAny>> {
+    if !matches!(framework, Framework::Pytorch) {
+        return Err(SafetensorError::new_err(
+            "prefetch loading currently only supports pytorch",
+        ));
+    }
+    let torch = get_module(py, &TORCH_MODULE)?;
+    let storage_shape = torch_storage_shape(dtype, logical_shape)?;
+
+    if buffer.len() == 0 {
+        return torch_empty_cuda(py, torch, dtype, &storage_shape, buffer.device());
+    }
+    let shape_i64 = storage_shape.iter().map(|&n| n as i64).collect();
+    let view_target = if dlpack::dlpack_supported_native(dtype) {
+        None
+    } else {
+        dlpack::torch_view_target(dtype)
+    };
+    let dl_dtype = if view_target.is_some() {
+        dlpack::uint8_dlpack()
+    } else {
+        dlpack::dtype_to_dlpack(dtype)
+    };
+
+    let device = dlpack::cuda_device(buffer.device());
+    let capsule = dlpack::to_capsule(py, buffer, shape_i64, dl_dtype, device)?;
+    let tensor = torch.call_method1(intern!(py, "from_dlpack"), (capsule,))?;
+    match view_target {
+        Some(name) => {
+            let target = torch.getattr(name)?;
+            Ok(tensor
+                .call_method1(intern!(py, "view"), (target,))?
+                .unbind())
+        }
+        None => Ok(tensor.unbind()),
+    }
+}
+
 /// Hand a filled `MTLBuffer` to the framework as a tensor via DLPack.
 ///
 /// Zero-byte tensors arrive as a clamp-allocated buffer (`alloc_shared`); the
@@ -2520,6 +2703,7 @@ fn _safetensors_rust(m: &PyBound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(serialize, m)?)?;
     m.add_function(wrap_pyfunction!(serialize_file, m)?)?;
     m.add_function(wrap_pyfunction!(deserialize, m)?)?;
+    m.add_class::<TensorStream>()?;
     m.add_class::<TensorSpec>()?;
     m.add_class::<safe_open>()?;
     m.add_class::<_safe_open_handle>()?;

@@ -668,6 +668,11 @@ impl Metadata {
         &self.tensors
     }
 
+    /// get the index of a given tensor in the [`Self::tensors`] array
+    pub fn tensor_idx(&self, name: &str) -> Option<usize> {
+        self.index_map.get(name).copied()
+    }
+
     /// Gives back the tensor metadata
     pub fn info(&self, name: &str) -> Option<&TensorInfo> {
         let &index = self.index_map.get(name)?;

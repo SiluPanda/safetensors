@@ -8,6 +8,8 @@ use pyo3::types::PyCapsule;
 
 use safetensors::Dtype;
 
+use crate::engine::CudaBuffer;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use crate::metal::MTLBuffer;
 
 // The structs and enums below are the ABI consumers read across the FFI
@@ -84,6 +86,7 @@ pub(crate) trait AsDevicePtr: Send + 'static {
     fn as_device_ptr(&self) -> *mut c_void;
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl AsDevicePtr for MTLBuffer {
     fn as_device_ptr(&self) -> *mut c_void {
         // PyTorch's MPS from_dlpack reads `data` as `id<MTLBuffer>` and
@@ -96,6 +99,12 @@ impl AsDevicePtr for MTLBuffer {
         // into `ManagedCtx` and stays valid until that ctx drops the
         // `Retained`, satisfying the `AsDevicePtr` invariant.
         self.as_metal_id_ptr()
+    }
+}
+
+impl AsDevicePtr for CudaBuffer {
+    fn as_device_ptr(&self) -> *mut c_void {
+        self.ptr() as *mut c_void
     }
 }
 
@@ -200,7 +209,6 @@ pub(crate) fn cpu_device() -> DLDevice {
     }
 }
 
-#[allow(dead_code)]
 pub(crate) fn cuda_device(ordinal: i32) -> DLDevice {
     DLDevice {
         device_type: DLDeviceType::Cuda,
@@ -208,6 +216,7 @@ pub(crate) fn cuda_device(ordinal: i32) -> DLDevice {
     }
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn metal_device() -> DLDevice {
     DLDevice {
         device_type: DLDeviceType::Metal,
