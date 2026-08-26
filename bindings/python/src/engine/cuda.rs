@@ -283,7 +283,7 @@ pub fn api() -> Option<&'static CudaApi> {
 
 #[cfg(test)]
 mod test {
-    use crate::cuda::{api, CudaApi};
+    use super::{api, CudaApi};
 
     fn cuda_or_skip() -> Option<&'static CudaApi> {
         match api() {

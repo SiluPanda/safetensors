@@ -4,7 +4,6 @@ mod dlpack;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod metal;
 
-mod cuda;
 mod engine;
 
 use core::slice;
@@ -1646,6 +1645,7 @@ struct PySafeSlice {
 use std::fmt;
 
 use crate::engine::{CudaBuffer, DeviceBuffer, Loader, LoaderError, TensorIter};
+
 struct Disp(Vec<TensorIndexer>);
 
 /// Should be more readable that the standard

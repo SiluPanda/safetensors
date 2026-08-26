@@ -23,6 +23,7 @@ use crate::metal::MTLBuffer;
 pub enum DLDeviceType {
     Cpu = 1,
     Cuda = 2,
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     Metal = 8,
 }
 
@@ -197,6 +198,7 @@ pub(crate) fn uint8_dlpack() -> DLDataType {
 
 /// Whether torch's MPS fast path can ingest this dtype, either via native
 /// DLPack support or via the `uint8 + view`-cast workaround.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn torch_mps_compatible(dtype: Dtype) -> bool {
     dlpack_supported_native(dtype) || torch_view_target(dtype).is_some()
 }
@@ -275,9 +277,8 @@ pub(crate) fn to_capsule<B: AsDevicePtr>(
         )
     };
     // On failure the destructor was never registered, so reclaim the tensor ourselves.
-    let capsule = capsule.map_err(|e| {
+    let capsule = capsule.inspect_err(|_| {
         unsafe { managed_tensor_deleter::<B>(managed) };
-        e
     })?;
     Ok(capsule.unbind())
 }
