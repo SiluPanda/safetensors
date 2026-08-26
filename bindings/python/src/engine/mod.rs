@@ -665,6 +665,7 @@ impl Iterator for TensorIter {
             let pos = self
                 .pending
                 .iter()
+                .take(64)
                 .position(|&idx| self.inner.sink.fully_scheduled(idx))
                 .unwrap_or(0);
             let idx = self.pending[pos];
