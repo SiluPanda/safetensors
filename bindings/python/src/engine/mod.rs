@@ -13,7 +13,6 @@ use std::{
     time::Duration,
 };
 
-use pyo3::{exceptions::PyValueError, PyErr};
 use safetensors::tensor::Metadata;
 
 use crate::cuda::{api, CudaApi, CudaError, Event, Stream};
@@ -40,12 +39,6 @@ impl Display for LoaderError {
 }
 
 impl std::error::Error for LoaderError {}
-
-impl From<LoaderError> for PyErr {
-    fn from(value: LoaderError) -> Self {
-        PyValueError::new_err(value.to_string())
-    }
-}
 
 impl From<CudaError> for LoaderError {
     fn from(value: CudaError) -> Self {

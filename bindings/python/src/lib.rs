@@ -1442,6 +1442,12 @@ impl Open {
     }
 }
 
+impl From<LoaderError> for PyErr {
+    fn from(value: LoaderError) -> Self {
+        SafetensorError::new_err(value.to_string())
+    }
+}
+
 /// Yields tensors in load-order
 #[pyclass]
 pub struct TensorStream {
@@ -1639,7 +1645,7 @@ struct PySafeSlice {
 
 use std::fmt;
 
-use crate::engine::{CudaBuffer, DeviceBuffer, Loader, TensorIter};
+use crate::engine::{CudaBuffer, DeviceBuffer, Loader, LoaderError, TensorIter};
 struct Disp(Vec<TensorIndexer>);
 
 /// Should be more readable that the standard
