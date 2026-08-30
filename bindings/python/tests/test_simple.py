@@ -218,6 +218,19 @@ class ReadmeTestCase(unittest.TestCase):
         loaded = load(out)
         self.assertTensorEqual(tensors, loaded, np.allclose)
 
+    def test_numpy_fortran_contiguous_roundtrip(self):
+        tensor = np.asfortranarray(np.arange(24, dtype=np.float32).reshape((2, 3, 4)))
+        self.assertFalse(tensor.flags.c_contiguous)
+        self.assertTrue(tensor.flags.f_contiguous)
+
+        loaded = load(save({"tensor": tensor}))["tensor"]
+        np.testing.assert_array_equal(loaded, tensor)
+
+        with tempfile.NamedTemporaryFile(suffix=".safetensors") as f:
+            save_file({"tensor": tensor}, f.name)
+            loaded = load_file(f.name)["tensor"]
+        np.testing.assert_array_equal(loaded, tensor)
+
     def test_torch_example(self):
         tensors = {
             "a": torch.randn((2, 2)),
